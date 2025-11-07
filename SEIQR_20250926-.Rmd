@@ -1,0 +1,677 @@
+---
+title: "SEIQR model with two quarantine paths (electronic & manual)"
+author: "you know"
+runtime: shiny
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, include=TRUE, fig.width = 8, fig.height = 5)
+
+library(DiagrammeR)
+library(deSolve)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(scales)
+library(knitr)
+library(tibble)
+library(readr)
+library(shiny)
+library(htmlwidgets)
+```
+
+```{r}
+# Population & initial conditions (N = 100,000)
+N   <- 100000L
+I0  <- 20
+E0  <- 80
+Q0  <- 0
+R0  <- 0
+S0  <- N - I0 - E0 - Q0 - R0
+
+# Core disease parameters
+R0_basic <- 2.5
+kappa    <- 1/7           # mean infectious period = 7 days
+beta     <- R0_basic * kappa
+sigma    <- 1/3           # mean latent period = 3 days
+
+# Manual quarantine (Qm) parameters
+gamma_m  <- 1/5    # mean time in Qm = 5 days (faster exit than I)
+rho_m    <- 0.02   # residual infectiousness in Qm (close to zero)
+
+# Time grid (sub-daily steps)
+Tmax  <- 200
+Times <- seq(0, Tmax, by = 0.5)
+
+# Helpers
+auc_trapz <- function(x, y) {
+  # Trapezoidal rule; accounts for dt = 0.5
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+to_per100k <- function(df, N, cols = c("S","E","I","Qm","R")) {
+  present <- intersect(cols, names(df))
+  df[present] <- lapply(df[present], function(v) (v * 1e5) / N)
+  df
+}
+```
+
+# Model 1: Manual Tracing (Qm)
+
+In the Qm-model, a proportion $\pi$ of infectious individuals moves into the manual quarantine compartment $Q_m$, while the remaining fraction $(1-\pi)$ recovers directly into $R$. The system is:
+
+* $\frac{dS}{dt}=-\lambda S$
+
+* $\frac{dE}{dt}=\lambda S-\sigma E$
+
+* $\frac{dI}{dt}=\sigma E-\kappa I$
+
+* $\frac{dQ_m}{dt}=\pi\kappa I-\gamma_m Q_m$
+
+* $\frac{dR}{dt}=(1-\pi)\kappa I+\gamma_m Q_m$, where the force of infection is $\lambda=\beta \frac{I+\rho_m Q_m}{N}$
+
+```{r}
+grViz("
+digraph seiqqr_m {
+  rankdir=LR;
+  node [shape=rectangle, style=filled, fillcolor=lightpink]
+  
+  S [label='S (Susceptible)']
+  E [label='E (Exposed)']
+  I [label='I (Infectious)']
+  Qm [label='Qm (Manual Quarantine)']
+  R [label='R (Removed)']
+
+  S -> E [label='β']
+  E -> I [label='σ']
+  I -> Qm [label='π κ']
+  I -> R  [label='(1-π) κ']
+  Qm -> R [label='γm']
+}
+")
+```
+
+## ODE definition and solver
+```{r}
+## ODE definition and solver (pi changes removal hazard from I)
+
+tau_max <- 1/5   # max tracing/removal rate when pi = 1 (mean ~5 days)
+# (Keep your earlier choices if set: gamma_m <- 1/5; rho_m <- 0.02)
+
+seiQRm_rhs <- function(t, state, par) {
+  with(as.list(c(state, par)), {
+    Npop   <- S + E + I + Qm + R
+    lambda <- beta * (I + rho_m * Qm) / Npop
+    tau    <- pi * tau_max   # tracing hazard scales with pi
+
+    dS  <- -lambda * S
+    dE  <-  lambda * S - sigma * E
+    dI  <-  sigma * E - (kappa + tau) * I          # <-- pi now changes exit rate
+    dQm <-  tau * I - gamma_m * Qm                 # inflow from tracing
+    dR  <-  kappa * I + gamma_m * Qm               # natural recovery + out of Qm
+
+    list(c(dS, dE, dI, dQm, dR))
+  })
+}
+
+run_qm <- function(pi,
+                   y0 = c(S = S0, E = E0, I = I0, Qm = Q0, R = R0),
+                   times = Times) {
+  stopifnot(pi >= 0, pi <= 1)
+  pars <- c(beta = beta, sigma = sigma, kappa = kappa,
+            gamma_m = gamma_m, rho_m = rho_m, tau_max = tau_max, pi = pi)
+  out <- deSolve::ode(y = y0, times = times, func = seiQRm_rhs, parms = pars, method = "lsoda")
+  as.data.frame(out)
+}
+```
+
+## Parameters
+```{r}
+# Baseline pi value (40% of I routed to Qm)
+pi_m_baseline <- 0.40   
+
+# Parameter table
+params_qm <- tibble(
+  Parameter = c("Population N", "β", "σ", "κ", "γₘ", "ρₘ", "π (Qm share)"),
+  Meaning   = c("Total population (individuals)",
+                "Transmission rate per contact",
+                "Rate E→I (1/σ = mean latent period)",
+                "Exit from I (1/κ = mean infectious period)",
+                "Exit from Qm (1/γₘ = mean time in Qm)",
+                "Residual infectiousness in Qm (0–1)",
+                "Proportion of I → Qm"),
+  Baseline  = c(comma(N), round(beta, 3), round(sigma,3), round(kappa, 3), round(gamma_m, 3), round(rho_m, 3), round(pi_m_baseline, 3)))
+
+kable(params_qm, caption = "Qm-model parameters (baseline)", align = c("c","l","c"))
+```
+
+## Baseline simulation (per 100,000)
+```{r}
+# Run baseline simulation
+qm_base <- run_qm(pi = pi_m_baseline)
+
+# Convert to per 100k
+qm_base_per100k <- to_per100k(qm_base, N, cols = c("S","E","I","Qm","R"))
+
+# Reshape for plotting
+qm_long <- qm_base_per100k %>%
+  select(time, S, E, I, Qm, R) %>%
+  pivot_longer(-time, names_to = "Compartment", values_to = "Per100k")
+
+# Plot all compartments in one panel
+ggplot(qm_long, aes(time, Per100k, color = Compartment)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Qm-model: baseline trajectories (per 100,000)",
+       x = "Time (days)", y = "Individuals per 100,000") +
+  theme_minimal()
+```
+
+```{r}
+# Baseline Qm at π = 0.40
+qm_base <- run_qm(pi = pi_m_baseline)
+qm_base_per100k <- to_per100k(qm_base, N, cols = c("E","I","Qm"))
+
+# Reshape
+qm_active <- qm_base_per100k %>%
+  select(time, E, I, Qm) %>%
+  pivot_longer(-time, names_to = "Compartment", values_to = "Per100k")
+
+# Plot
+ggplot(qm_active, aes(x = time, y = Per100k, color = Compartment)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Qm-model: Active compartments (E, I, Qm)",
+       x = "Time (days)", y = "Individuals per 100,000",
+       color = "Compartment") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2")
+```
+
+## Baseline metrics (AUC and peak)
+We compute the area under the infectious curve $\int I(t),dt$, the maximum value of $I(t)$, and the day of the peak. The AUC uses the trapezoidal rule, which accounts for the time step $\Delta t = 0.5$ days.
+```{r}
+## Baseline metrics (AUC and peak)
+
+# Time span over the simulation horizon (days)
+Tspan <- max(qm_base$time) - min(qm_base$time)
+
+# AUC of I(t): infectious-person-days (uses actual dt via diff(time))
+auc_I_counts <- auc_trapz(qm_base$time, qm_base$I)
+
+# Total possible person-days over the horizon
+total_possible_person_days <- N * Tspan
+
+# Peak I and peak day
+peak_I   <- max(qm_base$I)
+peak_day <- qm_base$time[which.max(qm_base$I)]
+
+# Pretty formatter for big numbers
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+
+metrics_qm <- tibble::tibble(
+  Metric = c("AUC of I(t)",
+             "Total possible person-days",
+             "Peak I",
+             "Peak I day (t)"),
+  Value  = c(fmt(auc_I_counts),
+             fmt(total_possible_person_days),
+             fmt(peak_I),
+             sprintf("%.1f", peak_day))
+)
+
+kable(metrics_qm, caption = "Qm-model: baseline metrics", align = c("l","c"))
+```
+
+## Sweep of π from 0 to 1 (AUC and peak day)
+We vary $\pi$ from 0 to 1. For each value, we compute the area under $I(t)$ (per $100{,}000$) and the day on which $I(t)$ peaks.
+```{r}
+# Sweep pi from 0 to 1
+pi_grid <- seq(0, 1, by = 0.05)
+
+qm_sweep <- map_dfr(pi_grid, function(p) {
+  sim   <- run_qm(pi = p)
+  sim_p <- to_per100k(sim, N, cols = c("I"))
+  tibble(
+    pi       = p,
+    auc_I    = auc_trapz(sim$time, sim_p$I),      # per-100k infectious-person-days
+    peak_I   = max(sim_p$I),                      # peak infectious per 100k
+    peak_day = sim$time[which.max(sim$I)]         # day of peak
+  )
+})
+
+# Plot: AUC(I) vs pi
+ggplot(qm_sweep, aes(x = pi, y = auc_I)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(color = "steelblue") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Qm-model: AUC(I) vs π",
+       x = "π (share of I → Qm)", y = "AUC of I(t) per 100,000") +
+  theme_minimal()
+
+# Plot: Peak day vs pi
+ggplot(qm_sweep, aes(x = pi, y = peak_day)) +
+  geom_line(linewidth = 1, color = "firebrick") +
+  geom_point(color = "firebrick") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Qm-model: Peak day of I(t) vs π",
+       x = "π (share of I → Qm)", y = "Peak I day (t)") +
+  theme_minimal()
+```
+
+## I(t) curve over various levels of $\pi$
+```{r}
+# Values of pi to illustrate flattening
+pi_levels <- c(0, 0.25, 0.5, 0.75, 1.0)
+
+# Simulations
+qm_multi <- map_dfr(pi_levels, function(p) {
+  sim   <- run_qm(pi = p)
+  sim_p <- to_per100k(sim, N, cols = c("I"))
+  sim_p %>%
+    select(time, I) %>%
+    mutate(pi = p)
+})
+
+# Plot I(t) for different pi
+ggplot(qm_multi, aes(x = time, y = I, color = factor(pi))) +
+  geom_line(linewidth = 1) +
+  labs(x = "Time (days)",
+       y = "Infectious individuals per 100,000",
+       color = "π (share of I → Qm)") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+## Interpretation
+* As the parameter $\pi$ increases, a larger fraction of infectious individuals move from the infectious compartment $I$ into the manual quarantine compartment $Q_m$. Because the exit rate from $Q_m$ is slower ($\gamma_m = 1/8$) than from $I$ ($\kappa = 1/7$), and because individuals in $Q_m$ remain partially infectious ($\rho_m = 0.3$), increasing $\pi$ leads to a longer average duration of partially infectious individuals in the population. Consequently, the cumulative infectious burden, measured as the area under $I(t)$, increases with $\pi$.
+
+* For the timing of the epidemic peak, the day of maximum $I(t)$ decreases as $\pi$ increases. This reflects the earlier diversion of individuals out of $I$ into $Q_m$, which accelerates the decline of the $I(t)$ trajectory. Thus, higher values of $\pi$ lead to a lower peak day, even as the cumulative burden remains elevated.
+
+* As $\pi$ increases, the height of the $I(t)$ curve decreases, while the width of the curve increases. This indicates that diverting a larger fraction of infectious individuals into $Q_m$ reduces the intensity of the epidemic at any given point in time but prolongs its duration. 
+
+# Model 2: Electronic Tracing (Qe)
+
+In the Qe-model, a proportion $\pi$ of infectious individuals moves into the electronic quarantine compartment $Q_e$, while the remaining fraction $(1-\pi)$ recovers directly into $R$. The system is:
+
+* $\frac{dS}{dt}=-\lambda S$, $\frac{dE}{dt}=\lambda S-\sigma E$
+
+* $\frac{dI}{dt}=\sigma E-(\kappa+\tau(\pi)) I$
+
+* $\frac{dQ_e}{dt}=\tau(\pi) I-\gamma_e Q_e$
+
+* $\frac{dR}{dt}=\kappa I+\gamma_e Q_e$, where $\tau(\pi)=\pi\tau_{\max}$ and the force of infection is $\lambda=\beta \frac{I+\rho_e Q_e}{N}$.
+
+```{r}
+grViz("
+digraph seiqqr_e {
+  rankdir=LR;
+  node [shape=rectangle, style=filled, fillcolor=lightblue]
+  
+  S [label='S (Susceptible)']
+  E [label='E (Exposed)']
+  I [label='I (Infectious)']
+  Qe [label='Qe (Electronic Quarantine)']
+  R [label='R (Removed)']
+
+  S -> E [label='β']
+  E -> I [label='σ']
+  I -> Qe [label='π τ']
+  I -> R  [label='κ']
+  Qe -> R [label='γe']
+}
+")
+```
+
+```{r}
+# Qe parameters
+gamma_e <- 1/4    # mean time in Qe = 4 days (faster than I)
+rho_e   <- 0.01   # residual infectiousness in Qe (close to zero)
+tau_max_e <- 1/4  # max tracing hazard (mean 4 days)
+
+seiQRe_rhs <- function(t, state, par) {
+  with(as.list(c(state, par)), {
+    Npop   <- S + E + I + Qe + R
+    lambda <- beta * (I + rho_e * Qe) / Npop
+    tau    <- pi * tau_max_e
+
+    dS  <- -lambda * S
+    dE  <-  lambda * S - sigma * E
+    dI  <-  sigma * E - (kappa + tau) * I
+    dQe <-  tau * I - gamma_e * Qe
+    dR  <-  kappa * I + gamma_e * Qe
+
+    list(c(dS, dE, dI, dQe, dR))
+  })
+}
+
+run_qe <- function(pi,
+                   y0 = c(S = S0, E = E0, I = I0, Qe = Q0, R = R0),
+                   times = Times) {
+  stopifnot(pi >= 0, pi <= 1)
+  pars <- c(beta = beta, sigma = sigma, kappa = kappa,
+            gamma_e = gamma_e, rho_e = rho_e,
+            tau_max_e = tau_max_e, pi = pi)
+  out <- deSolve::ode(y = y0, times = times, func = seiQRe_rhs, parms = pars, method = "lsoda")
+  as.data.frame(out)
+}
+```
+
+## Parameters
+```{r}
+# Baseline pi value (40% of I routed to Qe)
+pi_e_baseline <- 0.40   
+
+# Parameter table
+params_qe <- tibble(
+  Parameter = c("Population N", "β", "σ", "κ", "γₑ", "ρₑ", "π (Qe share)"),
+  Meaning   = c("Total population (individuals)",
+                "Transmission rate per contact",
+                "Rate E→I (1/σ = mean latent period)",
+                "Exit from I (1/κ = mean infectious period)",
+                "Exit from Qe (1/γₑ = mean time in Qe)",
+                "Residual infectiousness in Qe (0–1)",
+                "Proportion of I → Qe"),
+  Baseline  = c(comma(N), round(beta, 3), round(sigma,3), round(kappa, 3), round(gamma_e, 3), round(rho_e, 3), round(pi_e_baseline, 3)))
+
+kable(params_qe, caption = "Qe-model parameters (baseline)", align = c("c","l","c"))
+```
+
+## Baseline Simulation 
+```{r}
+qe_base <- run_qe(pi = pi_e_baseline)
+qe_base_per100k <- to_per100k(qe_base, N, cols = c("S","E","I","Qe","R"))
+
+qe_long <- qe_base_per100k %>%
+  select(time, S, E, I, Qe, R) %>%
+  pivot_longer(-time, names_to = "Compartment", values_to = "Per100k")
+
+ggplot(qe_long, aes(time, Per100k, color = Compartment)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Qe-model: baseline trajectories (per 100,000)",
+       x = "Time (days)", y = "Individuals per 100,000") +
+  theme_minimal()
+```
+
+```{r}
+# Baseline Qe at π = 0.40
+qe_base <- run_qe(pi = pi_e_baseline)
+qe_base_per100k <- to_per100k(qe_base, N, cols = c("E","I","Qe"))
+
+# Reshape
+qe_active <- qe_base_per100k %>%
+  select(time, E, I, Qe) %>%
+  pivot_longer(-time, names_to = "Compartment", values_to = "Per100k")
+
+# Plot
+ggplot(qe_active, aes(x = time, y = Per100k, color = Compartment)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Qe-model: Active compartments (E, I, Qe)",
+       x = "Time (days)", y = "Individuals per 100,000",
+       color = "Compartment") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2")
+```
+
+## Baseline Metrics (AUC and peak)
+```{r}
+Tspan <- max(qe_base$time) - min(qe_base$time)
+auc_I_counts <- auc_trapz(qe_base$time, qe_base$I)
+total_possible_person_days <- N * Tspan
+peak_I   <- max(qe_base$I)
+peak_day <- qe_base$time[which.max(qe_base$I)]
+
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+
+metrics_qe <- tibble(
+  Metric = c("AUC of I(t)",
+             "Total possible person-days",
+             "Peak I",
+             "Peak I day (t)"),
+  Value  = c(fmt(auc_I_counts),
+             fmt(total_possible_person_days),
+             fmt(peak_I),
+             sprintf("%.1f", peak_day))
+)
+
+kable(metrics_qe, caption = "Qe-model: baseline metrics", align = c("l","c"))
+```
+
+## Sweep of π from 0 to 1 (AUC and peak day)
+```{r}
+pi_grid <- seq(0, 1, by = 0.05)
+
+qe_sweep <- map_dfr(pi_grid, function(p) {
+  sim   <- run_qe(pi = p)
+  sim_p <- to_per100k(sim, N, cols = c("I"))
+  tibble(
+    pi       = p,
+    auc_I    = auc_trapz(sim$time, sim_p$I),
+    peak_I   = max(sim_p$I),
+    peak_day = sim$time[which.max(sim$I)]
+  )
+})
+
+ggplot(qe_sweep, aes(x = pi, y = auc_I)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(color = "steelblue") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Qe-model: AUC(I) vs π",
+       x = "π (share of I → Qe)", y = "AUC of I(t) per 100,000") +
+  theme_minimal()
+
+ggplot(qe_sweep, aes(x = pi, y = peak_day)) +
+  geom_line(linewidth = 1, color = "firebrick") +
+  geom_point(color = "firebrick") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Qe-model: Peak day of I(t) vs π",
+       x = "π (share of I → Qe)", y = "Peak I day (t)") +
+  theme_minimal()
+```
+
+## I(t) curve over various levels of $\pi$
+```{r}
+pi_levels <- c(0, 0.25, 0.5, 0.75, 1.0)
+
+qe_multi <- map_dfr(pi_levels, function(p) {
+  sim   <- run_qe(pi = p)
+  sim_p <- to_per100k(sim, N, cols = c("I"))
+  sim_p %>% select(time, I) %>% mutate(pi = p)
+})
+
+ggplot(qe_multi, aes(x = time, y = I, color = factor(pi))) +
+  geom_line(linewidth = 1) +
+  labs(x = "Time (days)",
+       y = "Infectious individuals per 100,000",
+       color = "π (share of I → Qe)") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+## Interpretation
+* As $\pi$ increases, more infectious individuals are diverted from $I$ into $Q_e$. Because the mean time in $Q_e$ is shorter ($\gamma_e=1/4$) and residual infectiousness is very low ($\rho_e=0.01$), higher $\pi$ values reduce both the height and the area under $I(t)$.
+
+* The epidemic peak occurs later in time as $\pi$ rises, consistent with effective early electronic tracing and isolation.
+
+* This dynamic demonstrates that electronic tracing can achieve more substantial flattening of the curve compared to manual tracing, given faster clearance and lower residual infectiousness.
+
+* For very high $\pi_e$, the epidemic is essentially extinguished before it takes off --- so the ``peak'' happens almost immediately. 
+When nearly all infectious individuals are traced and isolated effectively, there is no sustained epidemic curve.
+
+# Comparison of I(t): Qm vs Qe at π = 0.40
+```{r}
+# Run baseline Qm and Qe
+qm_40 <- run_qm(pi = pi_m_baseline)
+qe_40 <- run_qe(pi = pi_e_baseline)
+
+# Convert to per 100k
+qm_40_per100k <- to_per100k(qm_40, N, cols = c("I")) %>%
+  select(time, I) %>% mutate(Model = "Qm (manual)")
+qe_40_per100k <- to_per100k(qe_40, N, cols = c("I")) %>%
+  select(time, I) %>% mutate(Model = "Qe (electronic)")
+
+# Combine
+compare_40 <- bind_rows(qm_40_per100k, qe_40_per100k)
+
+# Plot comparison
+ggplot(compare_40, aes(x = time, y = I, color = Model)) +
+  geom_line(linewidth = 1.1) +
+  labs(title = expression(paste("Comparison of ", I(t), " at ", pi, " = 0.40")),
+       x = "Time (days)",
+       y = "Infectious individuals per 100,000",
+       color = "Model") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+# Interactive sliders for $\pi_m$ and $\pi_e$
+```{r}
+# Interactive sliders for pi_m and pi_e
+sliderInput("pi_m", label = HTML("&pi;<sub>m</sub> (share I → Qm)"),
+            min = 0, max = 1, value = 0.4, step = 0.05)
+
+sliderInput("pi_e", label = HTML("&pi;<sub>e</sub> (share I → Qe)"),
+            min = 0, max = 1, value = 0.4, step = 0.05)
+
+renderPlot({
+  # Run simulations for both models with chosen pi values
+  qm_sim <- run_qm(pi = input$pi_m)
+  qe_sim <- run_qe(pi = input$pi_e)
+  
+  qm_per100k <- to_per100k(qm_sim, N, cols = c("I")) %>%
+    select(time, I) %>%
+    mutate(Model = paste0("Qm (πm = ", input$pi_m, ")"))
+  
+  qe_per100k <- to_per100k(qe_sim, N, cols = c("I")) %>%
+    select(time, I) %>%
+    mutate(Model = paste0("Qe (πe = ", input$pi_e, ")"))
+  
+  both <- bind_rows(qm_per100k, qe_per100k)
+  
+  ggplot(both, aes(x = time, y = I, color = Model)) +
+    geom_line(linewidth = 1.2) +
+    labs(title = expression(paste("Interactive comparison of ", I(t),
+                                  " for manual (Qm) vs electronic (Qe) tracing")),
+         x = "Time (days)", y = "Infectious individuals per 100,000",
+         color = "Model") +
+    theme_minimal() +
+    scale_color_brewer(palette = "Set1")
+})
+```
+
+# Interactive 3-panel app: I(t), AUC, Peak day
+```{r}
+# --- Interactive 3-panel app: I(t), AUC, Peak Day ---
+library(shiny)
+library(patchwork)
+
+ui <- fluidPage(
+  titlePanel("SEIQR Explorer: Slider + 3 Plots"),
+  fluidRow(
+    column(3,
+      sliderInput("pi_m", HTML("&pi;<sub>m</sub> (share I → Qm)"),
+                  min = 0, max = 1, value = 0.4, step = 0.05),
+      sliderInput("pi_e", HTML("&pi;<sub>e</sub> (share I → Qe)"),
+                  min = 0, max = 1, value = 0.4, step = 0.05)
+    ),
+    column(9,
+      plotOutput("allPlots", height = "400px", width = "100%")
+    )
+  )
+)
+
+server <- function(input, output) {
+  output$allPlots <- renderPlot({
+
+    # --- Run simulations ---
+    qm_sim <- run_qm(pi = input$pi_m)
+    qe_sim <- run_qe(pi = input$pi_e)
+
+    qm_per100k <- to_per100k(qm_sim, N, cols = c("I")) %>%
+      select(time, I) %>% mutate(Model = paste0("Qm (πm=", input$pi_m, ")"))
+    qe_per100k <- to_per100k(qe_sim, N, cols = c("I")) %>%
+      select(time, I) %>% mutate(Model = paste0("Qe (πe=", input$pi_e, ")"))
+    both <- bind_rows(qm_per100k, qe_per100k)
+
+    # --- Panel 2: I(t) curves ---
+    p1 <- ggplot(both, aes(x = time, y = I, color = Model)) +
+      geom_line(linewidth = 1.2) +
+      labs(title = expression(I(t) ~ " trajectories"),
+           x = "Time (days)", y = "Infectious per 100,000") +
+      theme_minimal() +
+      scale_color_brewer(palette = "Set1")
+
+    # --- Panel 3: Peak infection day ---
+    peak_tbl <- tibble(
+      Model = c("Qm", "Qe"),
+      PeakDay = c(qm_sim$time[which.max(as.numeric(qm_sim[,"I"]))],
+                  qe_sim$time[which.max(as.numeric(qe_sim[,"I"]))])
+    )
+    p2 <- ggplot(peak_tbl, aes(x = Model, y = PeakDay, fill = Model)) +
+      geom_col(width = 0.6) +
+      labs(title = "Peak infection day", y = "Day", x = "") +
+      theme_minimal() +
+      scale_fill_brewer(palette = "Set1")
+
+    # --- Panel 4: AUC ---
+    qm_I <- as.numeric(qm_sim[,"I"])
+    qe_I <- as.numeric(qe_sim[,"I"])
+    auc_tbl <- tibble(
+      Model = c("Qm", "Qe"),
+      AUC = c(auc_trapz(qm_sim$time, qm_I)/(N/1e5),
+              auc_trapz(qe_sim$time, qe_I)/(N/1e5))
+    )
+    p3 <- ggplot(auc_tbl, aes(x = Model, y = AUC, fill = Model)) +
+      geom_col(width = 0.6) +
+      labs(title = "Area under I(t)", y = "AUC per 100,000", x = "") +
+      theme_minimal() +
+      scale_fill_brewer(palette = "Set1")
+
+    # --- Arrange in one row (4 panels wide) ---
+    (p1 | p2 | p3) + plot_layout(ncol = 3, guides = "collect") &
+      theme(legend.position = "bottom")
+  })
+}
+
+shinyApp(ui = ui, server = server)
+```
+
+# Lookup tables for AUC and peak day
+```{r}
+# --- Lookup tables for AUC and peak day ---
+
+# Grid of pi values (adjust step size as needed)
+pi_grid <- seq(0, 1, by = 0.01)
+
+# Compute metrics for Qm and Qe
+lookup_tbl <- map_dfr(pi_grid, function(p) {
+  qm_sim <- run_qm(pi = p)
+  qe_sim <- run_qe(pi = p)
+
+  tibble(
+    pi       = p,
+    auc_qm   = auc_trapz(qm_sim$time, qm_sim$I) / (N/1e5),   # per 100k
+    peak_qm  = qm_sim$time[which.max(qm_sim$I)],
+    auc_qe   = auc_trapz(qe_sim$time, qe_sim$I) / (N/1e5),   # per 100k
+    peak_qe  = qe_sim$time[which.max(qe_sim$I)]
+  )
+})
+
+# Split into two separate lookup tables
+lookup_auc  <- lookup_tbl %>% select(pi, auc_qm, auc_qe)
+lookup_peak <- lookup_tbl %>% select(pi, peak_qm, peak_qe)
+
+# Save to CSV
+write_csv(lookup_auc, "lookup_auc.csv")
+write_csv(lookup_peak, "lookup_peak.csv")
+
+# Preview
+head(lookup_auc)
+head(lookup_peak)
+```
+
+
